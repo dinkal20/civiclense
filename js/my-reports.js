@@ -6,7 +6,7 @@
 (() => {
     "use strict";
 
-    const API_BASE = "http://127.0.0.1:5000/api";
+    const API_BASE = `${window.location.origin}/api`;
     const MAX_IMAGE_PREVIEW_LENGTH = 12_000_000;
 
     const $ = (selector) => document.querySelector(selector);
