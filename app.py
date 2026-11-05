@@ -44,25 +44,11 @@ app.config.update(
     SECRET_KEY=secret_key,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=False,  # Local development only
+    SESSION_COOKIE_SECURE=True,  # Local development only
     PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
 )
 
-CORS(
-    app,
-    resources={
-        r"/api/*": {
-            "origins": [
-                "http://127.0.0.1:5500",
-                "http://localhost:5500",
-                "http://127.0.0.1:5501",
-                "http://localhost:5501",
-                "null",
-            ]
-        }
-    },
-    supports_credentials=True,
-)
+CORS(app, supports_credentials=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -2191,7 +2177,7 @@ def department_get_reports():
 
 if __name__ == "__main__":
     app.run(
-        host="127.0.0.1",
-        port=5000,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
         debug=False,
     )
