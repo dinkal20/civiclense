@@ -706,10 +706,6 @@ def serve_css(filename):
 def serve_js(filename):
     return send_from_directory(os.path.join(BASE_DIR, "js"), filename)
 
-
-@app.route("/api/health", methods=["GET"])
-def health():
-
 @app.route("/api/health", methods=["GET"])
 def health():
     try:
