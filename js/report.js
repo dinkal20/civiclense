@@ -3,7 +3,7 @@
 (() => {
     "use strict";
 
-    const API_BASE = "http://127.0.0.1:5000/api";
+    const API_BASE = `${window.location.origin}/api`;
     const USER_STORAGE_KEY = "civicfixUser";
     const MAX_IMAGE_SIZE = 8 * 1024 * 1024;
 
