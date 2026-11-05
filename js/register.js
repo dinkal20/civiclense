@@ -125,7 +125,7 @@ document.addEventListener("DOMContentLoaded", () => {
         try {
             /*
              * Flask API:
-             * POST http://127.0.0.1:5000/api/register
+             * POST /api/register
              *
              * Expected JSON:
              * {
@@ -137,7 +137,7 @@ document.addEventListener("DOMContentLoaded", () => {
              */
 
             const response = await fetch(
-                "http://127.0.0.1:5000/api/register",
+                `${window.location.origin}/api/register`,
                 {
                     method: "POST",
                     headers: {
@@ -194,7 +194,7 @@ document.addEventListener("DOMContentLoaded", () => {
             );
 
             showMessage(
-                "Could not reach Flask. Check that the backend is running at http://127.0.0.1:5000.",
+                "Could not connect to the server. Please try again.",
                 "error"
             );
         } finally {
