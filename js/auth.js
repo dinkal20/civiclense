@@ -36,7 +36,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const passwordInput = document.getElementById("password");
     const submitButton = loginForm?.querySelector('button[type="submit"], button:not([type])');
 
-    const API_BASE_URL = "http://127.0.0.1:5000";
+    const API_BASE_URL = window.location.origin;
 
     let adminMode = false;
     let isLoggingIn = false;
@@ -324,7 +324,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 console.error("CivicFix login error:", error);
 
                 showMessage(
-                    "Could not connect to Flask. Make sure the backend is running at http://127.0.0.1:5000.",
+                    "Could not connect to the server. Please try again.",
                     "error"
                 );
             } finally {
