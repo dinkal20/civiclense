@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify, session, send_from_directory
 from flask_cors import CORS
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
@@ -695,20 +695,7 @@ def find_active_department(data):
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({
-        "message": "CivicFix AI backend is running.",
-        "classifier": "YOLO (best.pt)",
-        "second_opinion_skipped_for": (
-            sorted(AI_TRUSTED_CATEGORIES)
-            or "none - every upload is checked"
-        ),
-        "vision_fallback": (
-            vision_fallback.status() if vision_fallback
-            else "module not loaded"
-        ),
-        "status": "ok",
-    })
-
+    return send_from_directory(BASE_DIR, "index.html")
 
 @app.route("/api/health", methods=["GET"])
 def health():
