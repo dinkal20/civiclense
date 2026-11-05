@@ -697,6 +697,19 @@ def find_active_department(data):
 def home():
     return send_from_directory(BASE_DIR, "index.html")
 
+@app.route("/css/<path:filename>")
+def serve_css(filename):
+    return send_from_directory(os.path.join(BASE_DIR, "css"), filename)
+
+
+@app.route("/js/<path:filename>")
+def serve_js(filename):
+    return send_from_directory(os.path.join(BASE_DIR, "js"), filename)
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+
 @app.route("/api/health", methods=["GET"])
 def health():
     try:
