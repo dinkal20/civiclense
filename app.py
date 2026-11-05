@@ -706,6 +706,39 @@ def serve_css(filename):
 def serve_js(filename):
     return send_from_directory(os.path.join(BASE_DIR, "js"), filename)
 
+# ==================================================
+# HTML PAGE ROUTES
+# ==================================================
+
+@app.route("/login.html")
+def login_page():
+    return send_from_directory(BASE_DIR, "login.html")
+
+
+@app.route("/register.html")
+def register_page():
+    return send_from_directory(BASE_DIR, "register.html")
+
+
+@app.route("/report.html")
+def report_page():
+    return send_from_directory(BASE_DIR, "report.html")
+
+
+@app.route("/my-reports.html")
+def my_reports_page():
+    return send_from_directory(BASE_DIR, "my-reports.html")
+
+
+@app.route("/department.html")
+def department_page():
+    return send_from_directory(BASE_DIR, "department.html")
+
+
+@app.route("/admin.html")
+def admin_page():
+    return send_from_directory(BASE_DIR, "admin.html")
+
 @app.route("/api/health", methods=["GET"])
 def health():
     try:
