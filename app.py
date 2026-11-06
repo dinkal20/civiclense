@@ -1323,7 +1323,8 @@ def admin_create_department():
             "error": "Status must be active or inactive."
         }), 400
 
-   if (
+    # Check all account collections for duplicate email addresses.
+    if (
         users_collection.find_one({"email": email})
         or admin_collection.find_one({"email": email})
         or departments_collection.find_one({"email": email})
@@ -1368,6 +1369,7 @@ def admin_create_department():
         return jsonify({
             "error": "An account with this email already exists."
         }), 409
+
     except Exception:
         logger.exception("Department creation failed")
         return jsonify({
