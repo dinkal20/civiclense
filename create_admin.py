@@ -5,11 +5,11 @@ from datetime import datetime, timezone
 from pymongo.errors import DuplicateKeyError
 from werkzeug.security import generate_password_hash
 
-from config import users_collection
+from config import users_collection, admin_collection
 
 
 def create_admin():
-    print("\n=== CivicFix AI: Create Admin Account ===\n")
+    print("\n=== CivicLens: Create Admin Account ===\n")
 
     name = input("Admin name: ").strip()
     email = input("Admin email: ").strip().lower()
@@ -28,32 +28,33 @@ def create_admin():
         print("Error: Passwords do not match.")
         return
 
-    # Prevent duplicate accounts across roles.
-    existing = users_collection.find_one({"email": email})
-    if existing:
-        print(
-            "Error: This email already exists in users. "
-            "Choose another email."
-        )
+    # Check both collections to prevent duplicate emails.
+    if users_collection.find_one({"email": email}):
+        print("Error: This email already exists in users.")
+        return
+
+    if admin_collection.find_one({"email": email}):
+        print("Error: This email already exists in admin.")
         return
 
     admin = {
         "name": name,
         "email": email,
         "password_hash": generate_password_hash(password),
-        "role": "admin",
         "created_at": datetime.now(timezone.utc),
     }
 
     try:
-        users_collection.insert_one(admin)
+        admin_collection.insert_one(admin)
+
         print("\nAdmin account created successfully!")
         print(f"Email: {email}")
         print("Password: stored securely as a hash.")
-        print("You can now use Administrator Access to log in.")
+        print("You can now log in as an administrator.")
 
     except DuplicateKeyError:
-        print("Error: An account with this email already exists.")
+        print("Error: An admin account with this email already exists.")
+
     except Exception as error:
         print(f"Could not create admin account: {error}")
 
