@@ -14,7 +14,6 @@ from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 from bson.errors import InvalidId
 from werkzeug.security import generate_password_hash, check_password_hash
-from ultralytics import YOLO
 from PIL import Image
 
 from config import (
@@ -44,7 +43,7 @@ app.config.update(
     SECRET_KEY=secret_key,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=True,  # Local development only
+    SESSION_COOKIE_SECURE=True,
     PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
 )
 
@@ -54,56 +53,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "best.pt")
 MAX_IMAGE_SIZE = 8 * 1024 * 1024
 
-# best.pt is a YOLO *detection* checkpoint (classes: pothole, garbage,
-# broken_streetlight, water_leakage). A detection model reports every
-# object it finds, so one photo can legitimately contain several issues.
-# These thresholds decide which of those boxes are trusted.
-# These are tuned to THIS checkpoint. best.pt records its own validation
-# scores: precision 0.72, recall 0.54, mAP50 0.64. In plain terms it finds
-# only about half of real issues and is wrong about a quarter of the time.
-# Strict cut-offs on a model that weak simply stall genuine complaints, so
-# a marginal call is routed anyway and flagged for a human to confirm.
-# Retrain the model and these can all be raised.
-AI_CONFIDENCE_THRESHOLD = 0.40   # a category must reach this to be used
-AI_DETECTION_FLOOR = 0.25        # weaker boxes are never even considered
-AI_STRONG_CONFIDENCE = 0.45      # a lone box below this is not trusted alone
-AI_LOW_CONFIDENCE_REVIEW = 0.60  # routed, but admin asked to confirm
-AI_SECONDARY_THRESHOLD = 0.55    # a 2nd issue must be clearer than the 1st
-AI_AMBIGUITY_MARGIN = 0.06       # top two categories this close = undecided
-AI_NMS_IOU = 0.45
+# AI review threshold
+AI_CONFIDENCE_THRESHOLD = 0.40
+AI_LOW_CONFIDENCE_REVIEW = 0.60
 
-# Measured on real photos, best.pt is confidently WRONG on most classes
-# (a working streetlight called broken at 0.89, kittens called property
-# damage at 0.79), so by default EVERY upload gets a second opinion.
-# Categories listed here may skip it when best.pt is also at least
-# AI_TRUSTED_MIN_CONFIDENCE sure. Saves API quota; widen only after
-# retraining and re-measuring. Example in .env:
-#     AI_TRUSTED_CATEGORIES=pothole
-AI_TRUSTED_CATEGORIES = {
-    name.strip().casefold()
-    for name in os.getenv("AI_TRUSTED_CATEGORIES", "").split(",")
-    if name.strip()
-}
-AI_TRUSTED_MIN_CONFIDENCE = 0.70
-AI_IMAGE_SIZE = 640
-AI_MAX_DETECTIONS = 20
-
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"YOLO model not found: {MODEL_PATH}")
-
-model = YOLO(MODEL_PATH)
-
-# Second opinion for the complaints YOLO cannot call confidently.
-# Optional: if the module or its API key is missing the backend simply
-# carries on with YOLO alone.
+# Hosted vision API is the only image classifier.
+# No local YOLO, PyTorch or OpenCV model is loaded.
 try:
     import vision_fallback
 except Exception:
     vision_fallback = None
-    logger.warning("vision_fallback module not loaded; YOLO only")
+    logger.exception("Hosted vision API module could not be loaded")
 
 
 # ==================================================
@@ -179,12 +141,17 @@ def report_to_dict(report, include_email=False):
     stored_image = report.get("image")
     image_url = None
 
+    # Preserve the original uploaded image MIME type.
+    # Older reports without this field default to JPEG.
+    image_mime_type = report.get("image_mime_type") or "image/jpeg"
+
     if isinstance(stored_image, str) and stored_image.strip():
-        image_url = (
-            stored_image
-            if stored_image.startswith("data:image/")
-            else f"data:image/jpeg;base64,{stored_image}"
-        )
+        if stored_image.startswith("data:image/"):
+            image_url = stored_image
+        else:
+            image_url = (
+                f"data:{image_mime_type};base64,{stored_image}"
+            )
 
     manual_reassignment = report.get("manual_reassignment")
     if not isinstance(manual_reassignment, dict):
@@ -206,9 +173,7 @@ def report_to_dict(report, include_email=False):
 
     created_at = iso_date(report.get("created_at"))
 
-    # A report can carry several AI categories. `ai_category` stays the
-    # display value the existing pages already read, so a multi-issue
-    # complaint shows every detected issue instead of just the first.
+    # A report can carry several AI categories.
     primary_category = report.get("ai_category")
     ai_categories = report.get("ai_categories")
 
@@ -234,6 +199,7 @@ def report_to_dict(report, include_email=False):
         "report_id": report_id,
         "image": image_url,
         "image_url": image_url,
+        "image_mime_type": image_mime_type,
         "latitude": report.get("latitude"),
         "longitude": report.get("longitude"),
         "address": report.get("address", ""),
@@ -245,7 +211,7 @@ def report_to_dict(report, include_email=False):
         "ai_categories": ai_categories,
         "ai_primary_category": primary_category,
         "ai_detections": report.get("ai_detections", []),
-        "ai_engine": report.get("ai_engine", "yolo"),
+        "ai_engine": report.get("ai_engine", "vision"),
         "ai_vision": report.get("ai_vision"),
         "issue_type": category_display or "Unclassified",
         "predicted_class": category_display,
@@ -268,18 +234,13 @@ def report_to_dict(report, include_email=False):
 
 
 def get_model_categories():
-    names = model.names
-
-    if isinstance(names, dict):
-        categories = [str(name) for name in names.values()]
-    elif isinstance(names, (list, tuple)):
-        categories = [str(name) for name in names]
-    else:
-        categories = []
-
-    return list(dict.fromkeys(
-        name.strip() for name in categories if name.strip()
-    ))
+    """Categories supported by CivicLens hosted image classification."""
+    return [
+        "pothole",
+        "garbage",
+        "broken_streetlight",
+        "water_leakage",
+    ]
 
 
 def get_allocated_categories(exclude_department_id=None):
@@ -354,227 +315,114 @@ def validate_unassigned_categories(categories):
     return selected, None
 
 
-def get_yolo_detections(image):
-    """Aggregate the model's boxes into one entry per category.
+# ==================================================
+# HOSTED VISION CLASSIFICATION
+# ==================================================
 
-    A detection model emits one box per object, so a single category can
-    appear many times and several categories can appear at once. Returning
-    only the single strongest box (the previous behaviour) threw away every
-    other issue in the photo and let one stray box decide the routing.
+def classify_with_second_opinion(image, image_bytes, mime_type="image/jpeg"):
+    """Classify a civic issue using only the hosted vision API."""
 
-    Returns a list sorted strongest first:
-        [{"category": str, "confidence": float, "detections": int}, ...]
-    """
-    predictions = model.predict(
-        source=image,
-        conf=AI_DETECTION_FLOOR,
-        iou=AI_NMS_IOU,
-        imgsz=AI_IMAGE_SIZE,
-        max_det=AI_MAX_DETECTIONS,
-        verbose=False,
-    )
+    categories = get_model_categories()
 
-    if not predictions:
-        return []
-
-    prediction = predictions[0]
-    names = prediction.names
-
-    def name_for(class_id):
-        if isinstance(names, dict):
-            return str(names.get(class_id, class_id))
-        try:
-            return str(names[class_id])
-        except (IndexError, KeyError, TypeError):
-            return str(class_id)
-
-    # Classification checkpoints expose .probs; detection ones do not.
-    probs = getattr(prediction, "probs", None)
-
-    if probs is not None:
-        return [{
-            "category": name_for(int(probs.top1)),
-            "confidence": float(probs.top1conf.item()),
-            "detections": 1,
-        }]
-
-    boxes = getattr(prediction, "boxes", None)
-
-    if boxes is None or len(boxes) == 0:
-        return []
-
-    aggregated = {}
-
-    for class_id, box_confidence in zip(
-        boxes.cls.tolist(),
-        boxes.conf.tolist(),
-    ):
-        category = name_for(int(class_id))
-        box_confidence = float(box_confidence)
-
-        entry = aggregated.setdefault(category, {
-            "category": category,
-            "confidence": 0.0,
-            "detections": 0,
-        })
-        entry["detections"] += 1
-        entry["confidence"] = max(entry["confidence"], box_confidence)
-
-    return sorted(
-        aggregated.values(),
-        key=lambda item: (item["confidence"], item["detections"]),
-        reverse=True,
-    )
-
-
-def classify_image(image):
-    """Turn raw detections into a routing decision.
-
-    Every category clearing AI_CONFIDENCE_THRESHOLD is kept, so a photo
-    showing a pothole *and* a broken streetlight reports both instead of
-    only the strongest one.
-    """
-    detections = get_yolo_detections(image)
-
-    accepted = [
-        item for item in detections
-        if item["confidence"] >= AI_CONFIDENCE_THRESHOLD
-    ]
-
-    # Claiming a photo shows a SECOND issue is a stronger claim than
-    # naming its main one, so an extra category has to be clearer: either
-    # comfortably confident, or backed by more than one box. Without this
-    # a single faint box turns every photo into a multi-issue complaint.
-    if accepted:
-        accepted = [accepted[0]] + [
-            item for item in accepted[1:]
-            if item["confidence"] >= AI_SECONDARY_THRESHOLD
-            or item["detections"] > 1
-        ]
-
-    categories = [item["category"] for item in accepted]
-
-    if accepted:
-        confidence = accepted[0]["confidence"]
-    elif detections:
-        confidence = detections[0]["confidence"]
-    else:
-        confidence = 0.0
-
-    # False-alarm guards. Both describe a prediction that is technically
-    # over the line but not actually supported by the image, which is
-    # where the old "one box wins" rule produced wrong categories.
-    #
-    # 1. A single category, barely over the threshold, backed by one box.
-    # 2. A single accepted category with a runner-up right behind it --
-    #    the winner is decided by noise, not by the picture.
-    weak_single = (
-        len(accepted) == 1
-        and accepted[0]["detections"] == 1
-        and accepted[0]["confidence"] < AI_STRONG_CONFIDENCE
-    )
-
-    ambiguous = (
-        len(accepted) == 1
-        and len(detections) > 1
-        and (accepted[0]["confidence"] - detections[1]["confidence"])
-        < AI_AMBIGUITY_MARGIN
-    )
-
-    return {
-        "categories": categories,
-        "category": categories[0] if categories else None,
-        "confidence": confidence,
-        "detections": detections,
-        "needs_review": not categories or weak_single or ambiguous,
+    analysis = {
+        "categories": [],
+        "category": None,
+        "confidence": 0.0,
+        "detections": [],
+        "needs_review": True,
+        "engine": "vision",
+        "vision": None,
+        "yolo_claim": [],
+        "vision_agrees": False,
+        "unverified": False,
+        "review_reason": None,
     }
 
+    if vision_fallback is None or not vision_fallback.is_enabled():
+        analysis["unverified"] = True
+        analysis["review_reason"] = (
+            "Hosted image classification is unavailable. "
+            "Admin review is required."
+        )
+        return analysis
 
-def classify_with_second_opinion(image, image_bytes):
-    """YOLO first, then a hosted vision model checks it.
-
-    best.pt is only trusted without a check for categories listed in
-    AI_TRUSTED_CATEGORIES (none by default). Otherwise the vision model's
-    answer has three distinct outcomes:
-
-      category     it names an issue. It wins, and the YOLO claim is kept
-                   alongside so an admin can see both when they disagree.
-      none         it says there is no civic issue. A YOLO claim is
-                   DROPPED and the complaint goes to a human, not to a
-                   department. This is evidence, not silence.
-      unavailable  no key / offline / quota. YOLO's call still routes so
-                   work can start, but it is flagged "unverified".
-    """
-    analysis = classify_image(image)
-    claimed = list(analysis["categories"])
-
-    analysis["engine"] = "yolo"
-    analysis["vision"] = None
-    analysis["yolo_claim"] = claimed
-    analysis["vision_agrees"] = False
-    analysis["unverified"] = False
-    analysis["review_reason"] = None
-
-    yolo_confidence = analysis["confidence"]
-    routable = bool(claimed) and not analysis["needs_review"]
-
-    trusted = (
-        routable
-        and yolo_confidence >= AI_TRUSTED_MIN_CONFIDENCE
-        and all(name.casefold() in AI_TRUSTED_CATEGORIES for name in claimed)
+    verdict = vision_fallback.classify(
+        image_bytes,
+        categories,
+        mime_type=mime_type,
     )
 
-    if trusted:
-        return analysis
-
-    if vision_fallback is None or not vision_fallback.is_enabled():
-        analysis["unverified"] = routable
-        return analysis
-
-    verdict = vision_fallback.classify(image_bytes, get_model_categories())
     analysis["vision"] = verdict
-    status = verdict.get("status")
 
-    if status == "category":
-        analysis["categories"] = [verdict["category"]]
-        analysis["category"] = verdict["category"]
-        analysis["confidence"] = verdict["confidence"]
-        analysis["needs_review"] = False
-        analysis["engine"] = "vision"
-        analysis["vision_agrees"] = verdict["category"] in claimed
+    if verdict.get("status") == "category":
+        category = verdict.get("category")
 
-        logger.info(
-            "Vision check: %s (%.2f); local model said %s",
-            verdict["category"], verdict["confidence"], claimed or "nothing",
+        try:
+            confidence = float(verdict.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        # Accept only categories supported by CivicLens.
+        matching_category = next(
+            (
+                item for item in categories
+                if isinstance(category, str)
+                and item.casefold() == category.strip().casefold()
+            ),
+            None,
         )
 
-    elif status == "none":
-        analysis["engine"] = "vision"
-        analysis["categories"] = []
-        analysis["category"] = None
-        analysis["needs_review"] = True
-
-        if claimed:
+        if matching_category is None:
             analysis["review_reason"] = (
-                "Local model suggested \"%s\" (%.0f%% sure) but the vision "
-                "check found no civic issue in this photo."
-                % (", ".join(claimed), yolo_confidence * 100)
+                "Hosted AI returned an unsupported category. "
+                "Admin review is required."
             )
+            return analysis
+
+        category = matching_category
+        confidence = max(0.0, min(confidence, 1.0))
+
+        analysis["categories"] = [category]
+        analysis["category"] = category
+        analysis["confidence"] = confidence
+        analysis["detections"] = [{
+            "category": category,
+            "confidence": confidence,
+            "detections": 1,
+        }]
+        analysis["needs_review"] = False
+        analysis["review_reason"] = (
+            "Hosted AI classification requires admin verification."
+        )
 
         logger.info(
-            "Vision check found no issue; dropped local claim %s",
-            claimed or "(none)",
+            "Hosted vision classified report as %s (%.2f)",
+            category,
+            confidence,
+        )
+
+    elif verdict.get("status") == "none":
+        analysis["review_reason"] = (
+            "The hosted AI could not identify a visible civic issue."
         )
 
     else:
-        analysis["unverified"] = routable
+        analysis["unverified"] = True
+        analysis["review_reason"] = (
+            "Hosted AI was unavailable. Admin review is required."
+        )
+
         logger.warning(
-            "Vision check unavailable (%s); keeping local result",
+            "Hosted vision unavailable: %s",
             verdict.get("reason"),
         )
 
     return analysis
 
+
+# ==================================================
+# DEPARTMENT HELPERS
+# ==================================================
 
 def find_departments_for_categories(categories):
     """Map each detected category to its active department.
@@ -665,7 +513,6 @@ def find_active_department(data):
     if not department_name:
         return None
 
-    # Exact case-insensitive match; escape regex metacharacters.
     return departments_collection.find_one({
         "name": {
             "$regex": "^" + re.escape(department_name) + "$",
@@ -676,12 +523,13 @@ def find_active_department(data):
 
 
 # ==================================================
-# HEALTH CHECK
+# HEALTH CHECK AND PAGE ROUTES
 # ==================================================
 
 @app.route("/", methods=["GET"])
 def home():
     return send_from_directory(BASE_DIR, "index.html")
+
 
 @app.route("/css/<path:filename>")
 def serve_css(filename):
@@ -692,9 +540,6 @@ def serve_css(filename):
 def serve_js(filename):
     return send_from_directory(os.path.join(BASE_DIR, "js"), filename)
 
-# ==================================================
-# HTML PAGE ROUTES
-# ==================================================
 
 @app.route("/login.html")
 def login_page():
@@ -724,6 +569,7 @@ def department_page():
 @app.route("/admin.html")
 def admin_page():
     return send_from_directory(BASE_DIR, "admin.html")
+
 
 @app.route("/api/health", methods=["GET"])
 def health():
@@ -892,7 +738,7 @@ def admin_get_categories():
 
 
 # ==================================================
-# CREATE COMPLAINT
+# CREATE REPORT
 # ==================================================
 
 @app.route("/api/reports", methods=["POST"])
@@ -909,10 +755,15 @@ def create_report():
         return jsonify({"error": "Description is required."}), 400
 
     if not isinstance(image_data, str) or not image_data:
-        return jsonify({"error": "A complaint image is required."}), 400
+        return jsonify({"error": "A report image is required."}), 400
+
+    mime_type = "image/jpeg"
 
     if image_data.startswith("data:") and "," in image_data:
-        image_data = image_data.split(",", 1)[1]
+        header, image_data = image_data.split(",", 1)
+
+        if header.startswith("data:") and ";" in header:
+            mime_type = header[5:].split(";", 1)[0].strip().lower()
 
     try:
         image_bytes = base64.b64decode(image_data, validate=True)
@@ -929,17 +780,27 @@ def create_report():
 
     try:
         with Image.open(io.BytesIO(image_bytes)) as uploaded_image:
+            detected_mime_type = Image.MIME.get(uploaded_image.format)
+
+            if detected_mime_type:
+                mime_type = detected_mime_type
+
             uploaded_image.verify()
 
-        with Image.open(io.BytesIO(image_bytes)) as uploaded_image:
-            image = uploaded_image.convert("RGB")
     except Exception:
         return jsonify({"error": "Please upload a valid image."}), 400
 
+    if not mime_type.startswith("image/"):
+        return jsonify({"error": "Unsupported image format."}), 400
+
     try:
-        analysis = classify_with_second_opinion(image, image_bytes)
+        analysis = classify_with_second_opinion(
+            None,
+            image_bytes,
+            mime_type,
+        )
     except Exception:
-        logger.exception("YOLO prediction failed")
+        logger.exception("Hosted image classification failed")
         return jsonify({
             "error": "Image analysis failed. Please try again."
         }), 500
@@ -958,53 +819,51 @@ def create_report():
     department_name = department.get("name") if department else None
     department_names = [item[1].get("name") for item in routed]
 
-    # One photo can show more than one issue (a broken road *and* a
-    # broken streetlight). A complaint record owns one department, so the
-    # strongest category's department is assigned straight away and work
-    # can start, while admin gets a note about anything else in the photo.
+    # One photo can show more than one issue.
     multi_department = len(department_names) > 1
     extra_issues = department_names[1:] + unrouted
 
-    # Given how weak this model is, a shaky call is still routed rather
-    # than held -- holding stalls a real complaint -- but it is flagged so
-    # a person confirms it instead of it being trusted silently.
+    # Lower-confidence classifications are flagged for human review.
     low_confidence = (
         not is_unclassified
         and confidence < AI_LOW_CONFIDENCE_REVIEW
     )
 
-    # A category that came from the hosted model rather than from our own
-    # trained weights always gets a human glance, however sure it sounded.
-    # (When the local model independently said the same thing, that is
-    # agreement, not a lone hosted guess, so no extra glance is needed.)
+    # Every hosted AI classification is reviewed by a person.
     from_vision = (
         analysis.get("engine") == "vision"
-        and not analysis.get("vision_agrees")
+        and not analysis.get("unverified")
     )
 
-    # The second opinion could not be reached, so the local model's call
-    # was never double-checked. Route it, but never silently.
     unverified = bool(analysis.get("unverified"))
 
-    # Nothing to route at all -> admin has to assign it by hand.
+    # Nothing to route -> admin has to assign it manually.
     needs_manual_assignment = is_unclassified or department is None
 
     # Routed, but a person should look at it.
     needs_additional_review = (
         not needs_manual_assignment
-        and (multi_department or bool(unrouted) or low_confidence
-             or from_vision or unverified)
+        and (
+            multi_department
+            or bool(unrouted)
+            or low_confidence
+            or from_vision
+            or unverified
+        )
     )
 
     manual_reassignment = None
 
     if needs_manual_assignment:
         reason = (
-            (analysis.get("review_reason")
-             or "AI could not confidently classify this complaint.")
+            (
+                analysis.get("review_reason")
+                or "AI could not confidently classify this report."
+            )
             if is_unclassified
             else "No active department is assigned to the AI category."
         )
+
         manual_reassignment = {
             "status": "pending",
             "reason": reason,
@@ -1013,12 +872,13 @@ def create_report():
             "previous_department": "",
             "request_type": "manual_assignment",
         }
+
     elif needs_additional_review:
         notes = []
 
         if multi_department or unrouted:
             notes.append(
-                "Complaint shows more than one issue ("
+                "Report shows more than one issue ("
                 + ", ".join(categories)
                 + ")."
             )
@@ -1039,29 +899,25 @@ def create_report():
 
         if from_vision:
             verdict = analysis.get("vision") or {}
-            yolo_claim = analysis.get("yolo_claim") or []
+
             detail = (
-                ": " + verdict["reason"] if verdict.get("reason") else ""
+                ": " + verdict["reason"]
+                if verdict.get("reason")
+                else ""
             )
-            if yolo_claim:
-                notes.append(
-                    "The local model said \"%s\" but the vision check says "
-                    "\"%s\" (%.0f%% sure%s) - please confirm."
-                    % (", ".join(yolo_claim), category,
-                       confidence * 100, detail)
-                )
-            else:
-                notes.append(
-                    "The local model could not classify this. Vision "
-                    "check says \"%s\" (%.0f%% sure%s) - please confirm."
-                    % (category, confidence * 100, detail)
-                )
+
+            notes.append(
+                "Hosted vision AI classified this as \"%s\" "
+                "(%.0f%% confidence%s) - please confirm."
+                % (category, confidence * 100, detail)
+            )
+
         elif unverified:
             notes.append(
-                "The vision check was unavailable, so the local model's "
-                "call \"%s\" (%.0f%% sure) is unverified - please confirm."
-                % (category, confidence * 100)
+                "Hosted vision AI was unavailable. "
+                "The report needs manual verification."
             )
+
         elif low_confidence:
             notes.append(
                 "AI is only %.0f%% sure of \"%s\" - please confirm."
@@ -1095,6 +951,7 @@ def create_report():
         return jsonify({"error": "Longitude is out of range."}), 400
 
     location_method = str(data.get("location_method", "manual")).lower()
+
     if location_method not in ("live", "manual"):
         location_method = "manual"
 
@@ -1102,6 +959,7 @@ def create_report():
         "email": account["email"].lower(),
         "description": description,
         "image": base64.b64encode(image_bytes).decode("utf-8"),
+        "image_mime_type": mime_type,
         "latitude": latitude,
         "longitude": longitude,
         "address": str(data.get("address", "")).strip(),
@@ -1112,8 +970,9 @@ def create_report():
         "ai_departments": department_names,
         "ai_unrouted_categories": unrouted,
         "ai_extra_issue_departments": extra_issues,
-        "ai_engine": analysis.get("engine", "yolo"),
+        "ai_engine": analysis.get("engine", "vision"),
         "ai_vision": analysis.get("vision"),
+        # Kept for compatibility with existing report data and frontend.
         "ai_yolo_claim": analysis.get("yolo_claim"),
         "ai_unverified": unverified,
         "confidence": confidence,
@@ -1129,15 +988,15 @@ def create_report():
     try:
         result = reports_collection.insert_one(report)
     except Exception:
-        logger.exception("Saving complaint failed")
-        return jsonify({"error": "Could not save your complaint."}), 500
+        logger.exception("Saving report failed")
+        return jsonify({"error": "Could not save your report."}), 500
 
     return jsonify({
-        "message": "Complaint submitted successfully.",
+        "message": "Report submitted successfully.",
         "report_id": str(result.inserted_id),
         "ai_category": report["ai_category"],
         "ai_categories": categories,
-        "ai_engine": analysis.get("engine", "yolo"),
+        "ai_engine": analysis.get("engine", "vision"),
         "confidence": confidence,
         "department": department_name,
         "status": "Pending",
@@ -1148,7 +1007,7 @@ def create_report():
 
 
 # ==================================================
-# CITIZEN: VIEW OWN COMPLAINTS
+# CITIZEN: VIEW OWN REPORTS
 # ==================================================
 
 @app.route("/api/reports/<email>", methods=["GET"])
@@ -1157,7 +1016,7 @@ def get_user_reports(email):
     account = current_account()
     email = email.strip().lower()
 
-    # Citizens may only view their own complaints.
+    # Citizens may only view their own reports.
     # Departments must use /api/department/reports.
     if account.get("role") == "user":
         if account.get("email", "").lower() != email:
@@ -1175,7 +1034,7 @@ def get_user_reports(email):
 
 
 # ==================================================
-# ADMIN: VIEW ALL COMPLAINTS
+# ADMIN: VIEW ALL REPORTS
 # ==================================================
 
 @app.route("/api/admin/reports", methods=["GET"])
@@ -1193,7 +1052,7 @@ def admin_get_reports():
 
 
 # ==================================================
-# ADMIN: DIRECTLY REJECT A COMPLAINT
+# ADMIN: DIRECTLY REJECT A REPORT
 # ==================================================
 
 @app.route("/api/admin/reports/<report_id>/reject", methods=["POST"])
@@ -1203,7 +1062,7 @@ def admin_reject_report(report_id):
     object_id = get_object_id(report_id)
 
     if object_id is None:
-        return jsonify({"error": "Invalid complaint ID."}), 400
+        return jsonify({"error": "Invalid report ID."}), 400
 
     data = request.get_json(silent=True) or {}
     reason = str(data.get("reason", "")).strip()
@@ -1216,11 +1075,11 @@ def admin_reject_report(report_id):
     report = reports_collection.find_one({"_id": object_id})
 
     if not report:
-        return jsonify({"error": "Complaint not found."}), 404
+        return jsonify({"error": "Report not found."}), 404
 
     if str(report.get("status", "")).strip().lower() == "rejected":
         return jsonify({
-            "error": "This complaint has already been rejected."
+            "error": "This report has already been rejected."
         }), 409
 
     account = current_account()
@@ -1247,7 +1106,7 @@ def admin_reject_report(report_id):
             "rejection_request.reviewed_at": now,
             "rejection_request.reviewed_by": account.get("email", ""),
             "rejection_request.admin_note":
-                "Complaint rejected directly by admin.",
+                "Report rejected directly by admin.",
         })
 
     result = reports_collection.update_one(
@@ -1257,11 +1116,11 @@ def admin_reject_report(report_id):
 
     if result.modified_count != 1:
         return jsonify({
-            "error": "The complaint changed. Refresh and try again."
+            "error": "The report changed. Refresh and try again."
         }), 409
 
     return jsonify({
-        "message": "Complaint rejected successfully.",
+        "message": "Report rejected successfully.",
         "status": "Rejected",
         "rejection_reason": reason,
         "report_id": str(object_id),
@@ -1320,18 +1179,18 @@ def review_rejection_request(report_id, decision):
     object_id = get_object_id(report_id)
 
     if object_id is None:
-        return jsonify({"error": "Invalid complaint ID."}), 400
+        return jsonify({"error": "Invalid report ID."}), 400
 
     report = reports_collection.find_one({"_id": object_id})
 
     if not report:
-        return jsonify({"error": "Complaint not found."}), 404
+        return jsonify({"error": "Report not found."}), 404
 
     rejection_request = report.get("rejection_request")
 
     if not isinstance(rejection_request, dict):
         return jsonify({
-            "error": "No rejection request exists for this complaint."
+            "error": "No rejection request exists for this report."
         }), 409
 
     if str(rejection_request.get("status", "")).lower() != "pending":
@@ -1341,7 +1200,7 @@ def review_rejection_request(report_id, decision):
 
     if str(report.get("status", "")).strip().lower() != "rejection requested":
         return jsonify({
-            "error": "The complaint is no longer awaiting rejection review."
+            "error": "The report is no longer awaiting rejection review."
         }), 409
 
     account = current_account()
@@ -1353,7 +1212,7 @@ def review_rejection_request(report_id, decision):
         rejection_reason = rejection_request.get("reason", "")
     else:
         new_status = "Pending"
-        message = "Rejection request disapproved. The complaint is pending again."
+        message = "Rejection request disapproved. The report is pending again."
         rejection_reason = ""
 
     result = reports_collection.update_one(
@@ -1553,7 +1412,6 @@ def admin_update_department_status(department_id):
 # ADMIN: MANUAL ASSIGNMENT / REASSIGNMENT QUEUE
 # ==================================================
 
-
 @app.route("/api/admin/reassignment-requests", methods=["GET"])
 @login_required
 @role_required("admin")
@@ -1595,7 +1453,7 @@ def admin_get_reassignment_requests():
 
             reassignment = {
                 "status": "pending",
-                "reason": "AI could not confidently classify this complaint.",
+                "reason": "AI could not confidently classify this report.",
                 "requested_by": "AI System",
                 "requested_at": report.get("created_at"),
                 "previous_department": "",
@@ -1639,7 +1497,7 @@ def admin_get_reassignment_requests():
             "reassignment_status": "pending",
             "request_type": request_type,
             "request_label": (
-                "Manual Complaint Assignment"
+                "Manual Report Assignment"
                 if request_type == "manual_assignment"
                 else "Additional Issue Detected"
                 if request_type == "additional_department"
@@ -1653,9 +1511,8 @@ def admin_get_reassignment_requests():
     return jsonify({"requests": requests_list}), 200
 
 
-
 # ==================================================
-# ADMIN: ASSIGN OR REASSIGN A COMPLAINT
+# ADMIN: ASSIGN OR REASSIGN A REPORT
 # ==================================================
 
 @app.route(
@@ -1668,24 +1525,24 @@ def admin_assign_reassignment_department(report_id):
     object_id = get_object_id(report_id)
 
     if object_id is None:
-        return jsonify({"error": "Invalid complaint ID."}), 400
+        return jsonify({"error": "Invalid report ID."}), 400
 
     data = request.get_json(silent=True) or {}
     report = reports_collection.find_one({"_id": object_id})
 
     if not report:
-        return jsonify({"error": "Complaint not found."}), 404
+        return jsonify({"error": "Report not found."}), 404
 
     reassignment = report.get("manual_reassignment")
 
     if not isinstance(reassignment, dict):
         return jsonify({
-            "error": "This complaint is not awaiting manual assignment."
+            "error": "This report is not awaiting manual assignment."
         }), 409
 
     if str(reassignment.get("status", "")).lower() != "pending":
         return jsonify({
-            "error": "This complaint is not awaiting assignment."
+            "error": "This report is not awaiting assignment."
         }), 409
 
     department = find_active_department(data)
@@ -1703,8 +1560,6 @@ def admin_assign_reassignment_department(report_id):
     account = current_account()
     now = utc_now()
 
-    # Compare-and-update prevents two admins assigning the same request
-    # at the same time. Department selection accepts ID or name.
     result = reports_collection.update_one(
         {
             "_id": object_id,
@@ -1731,7 +1586,7 @@ def admin_assign_reassignment_department(report_id):
         }), 409
 
     return jsonify({
-        "message": "Complaint assigned successfully.",
+        "message": "Report assigned successfully.",
         "department": actual_department_name,
         "department_id": str(department["_id"]),
         "status": "Pending",
@@ -1741,7 +1596,7 @@ def admin_assign_reassignment_department(report_id):
 
 
 # ==================================================
-# DEPARTMENT: ACCESS A COMPLAINT
+# DEPARTMENT: ACCESS A REPORT
 # ==================================================
 
 def get_department_owned_report(report_id):
@@ -1749,7 +1604,7 @@ def get_department_owned_report(report_id):
 
     if object_id is None:
         return None, None, (
-            jsonify({"error": "Invalid complaint ID."}), 400
+            jsonify({"error": "Invalid report ID."}), 400
         )
 
     account = current_account()
@@ -1770,7 +1625,7 @@ def get_department_owned_report(report_id):
 
     if not report:
         return None, department, (
-            jsonify({"error": "Complaint not found."}), 404
+            jsonify({"error": "Report not found."}), 404
         )
 
     reassignment = report.get("manual_reassignment")
@@ -1782,7 +1637,7 @@ def get_department_owned_report(report_id):
     ):
         return None, department, (
             jsonify({
-                "error": "This complaint is awaiting admin assignment."
+                "error": "This report is awaiting admin assignment."
             }), 409
         )
 
@@ -1796,12 +1651,11 @@ def get_department_owned_report(report_id):
         ):
             return None, department, (
                 jsonify({
-                    "error": "This complaint is assigned to another department."
+                    "error": "This report is assigned to another department."
                 }), 403
             )
     else:
-        # Only legacy complaints without a department can use category
-        # matching. Never allow an explicitly assigned complaint through.
+        # Legacy reports without a department can use category matching.
         categories = department.get("categories", [])
         category = report.get("ai_category")
 
@@ -1817,7 +1671,7 @@ def get_department_owned_report(report_id):
         ):
             return None, department, (
                 jsonify({
-                    "error": "This complaint is not assigned to your department."
+                    "error": "This report is not assigned to your department."
                 }), 403
             )
 
@@ -1852,7 +1706,7 @@ def department_request_reassignment(report_id):
 
     if str(report.get("status", "Pending")).strip().lower() != "pending":
         return jsonify({
-            "error": "Only pending complaints can be sent for reassignment."
+            "error": "Only pending reports can be sent for reassignment."
         }), 409
 
     existing_request = report.get("manual_reassignment")
@@ -1862,7 +1716,7 @@ def department_request_reassignment(report_id):
         and str(existing_request.get("status", "")).lower() == "pending"
     ):
         return jsonify({
-            "error": "This complaint is already awaiting reassignment."
+            "error": "This report is already awaiting reassignment."
         }), 409
 
     rejection_request = report.get("rejection_request")
@@ -1892,8 +1746,6 @@ def department_request_reassignment(report_id):
         {
             "_id": report["_id"],
             "status": report.get("status", "Pending"),
-            # An "additional_department" note must not block the
-            # department that already owns the complaint.
             "$or": [
                 {"manual_reassignment.status": {"$ne": "pending"}},
                 {"manual_reassignment.request_type":
@@ -1909,7 +1761,7 @@ def department_request_reassignment(report_id):
 
     if result.modified_count != 1:
         return jsonify({
-            "error": "The complaint changed. Refresh and try again."
+            "error": "The report changed. Refresh and try again."
         }), 409
 
     return jsonify({
@@ -1919,7 +1771,7 @@ def department_request_reassignment(report_id):
 
 
 # ==================================================
-# DEPARTMENT: REQUEST COMPLAINT REJECTION
+# DEPARTMENT: REQUEST REPORT REJECTION
 # ==================================================
 
 @app.route(
@@ -1948,7 +1800,7 @@ def department_request_report_rejection(report_id):
 
     if status != "pending":
         return jsonify({
-            "error": "Only pending complaints can be submitted for rejection."
+            "error": "Only pending reports can be submitted for rejection."
         }), 409
 
     existing_request = report.get("rejection_request")
@@ -1983,7 +1835,7 @@ def department_request_report_rejection(report_id):
 
     if result.modified_count != 1:
         return jsonify({
-            "error": "The complaint changed. Refresh and try again."
+            "error": "The report changed. Refresh and try again."
         }), 409
 
     return jsonify({
@@ -1993,7 +1845,7 @@ def department_request_report_rejection(report_id):
 
 
 # ==================================================
-# DEPARTMENT: ACCEPT COMPLAINT
+# DEPARTMENT: ACCEPT REPORT
 # ==================================================
 
 @app.route(
@@ -2012,7 +1864,7 @@ def department_accept_report(report_id):
 
     if str(report.get("status", "Pending")).strip().lower() != "pending":
         return jsonify({
-            "error": "Only pending complaints can be accepted."
+            "error": "Only pending reports can be accepted."
         }), 409
 
     result = reports_collection.update_one(
@@ -2020,8 +1872,6 @@ def department_accept_report(report_id):
             "_id": report["_id"],
             "status": report.get("status", "Pending"),
             "department": department.get("name"),
-            # An "additional_department" note must not block the
-            # department that already owns the complaint.
             "$or": [
                 {"manual_reassignment.status": {"$ne": "pending"}},
                 {"manual_reassignment.request_type":
@@ -2039,16 +1889,17 @@ def department_accept_report(report_id):
 
     if result.modified_count != 1:
         return jsonify({
-            "error": "The complaint changed. Refresh and try again."
+            "error": "The report changed. Refresh and try again."
         }), 409
 
     return jsonify({
-        "message": "Complaint accepted successfully.",
+        "message": "Report accepted successfully.",
         "status": "In Progress",
     }), 200
 
+
 # ==================================================
-# DEPARTMENT: MARK COMPLAINT AS COMPLETED
+# DEPARTMENT: MARK REPORT AS COMPLETED
 # ==================================================
 
 @app.route(
@@ -2069,7 +1920,7 @@ def department_complete_report(report_id):
 
     if status not in ("in progress", "in_progress"):
         return jsonify({
-            "error": "Only complaints in progress can be marked completed."
+            "error": "Only reports in progress can be marked completed."
         }), 409
 
     result = reports_collection.update_one(
@@ -2086,17 +1937,17 @@ def department_complete_report(report_id):
 
     if result.modified_count != 1:
         return jsonify({
-            "error": "The complaint changed. Refresh and try again."
+            "error": "The report changed. Refresh and try again."
         }), 409
 
     return jsonify({
-        "message": "Complaint marked as completed successfully.",
+        "message": "Report marked as completed successfully.",
         "status": "Completed",
     }), 200
 
 
 # ==================================================
-# DEPARTMENT: VIEW ASSIGNED COMPLAINTS
+# DEPARTMENT: VIEW ASSIGNED REPORTS
 # ==================================================
 
 @app.route("/api/department/reports", methods=["GET"])
@@ -2148,10 +1999,8 @@ def department_get_reports():
     if not conditions:
         return jsonify({"reports": []}), 200
 
-    # A pending request normally hides a complaint from departments. The
-    # exception is an "additional_department" note: that complaint is
-    # already assigned to this department and the note only tells admin
-    # about the other issues in the photo, so work should not wait on it.
+    # A pending additional-issue note does not block the assigned
+    # department from working on the report.
     reports = list(reports_collection.find({
         "$and": [
             {"$or": conditions},
