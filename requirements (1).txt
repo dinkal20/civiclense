@@ -1,3 +1,4 @@
+
 # CivicLens - Python Backend Dependencies
 
 # Backend
@@ -9,8 +10,8 @@ gunicorn
 pymongo[srv]
 python-dotenv
 
-# Computer Vision / AI (YOLO)
-ultralytics>=8.3,<9.0
-opencv-python-headless>=4.9,<5.0
+# Image processing
 Pillow>=10.0,<13.0
+
+# Image data processing
 numpy>=1.26,<3.0
