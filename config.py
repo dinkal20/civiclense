@@ -29,6 +29,7 @@ db = client["civicfix"]
 users_collection = db["users"]
 reports_collection = db["reports"]
 departments_collection = db["departments"]
+admin_collection = db["admin"]
 
 
 def test_database_connection():
