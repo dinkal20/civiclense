@@ -1,11 +1,10 @@
-
 from getpass import getpass
 from datetime import datetime, timezone
 
 from pymongo.errors import DuplicateKeyError
 from werkzeug.security import generate_password_hash
 
-from config import users_collection, admin_collection
+from config import users_collection, admin_collection, departments_collection
 
 
 def create_admin():
@@ -28,13 +27,17 @@ def create_admin():
         print("Error: Passwords do not match.")
         return
 
-    # Check both collections to prevent duplicate emails.
+    # Check all account collections for duplicate emails.
     if users_collection.find_one({"email": email}):
         print("Error: This email already exists in users.")
         return
 
     if admin_collection.find_one({"email": email}):
         print("Error: This email already exists in admin.")
+        return
+
+    if departments_collection.find_one({"email": email}):
+        print("Error: This email already exists in departments.")
         return
 
     admin = {
