@@ -20,6 +20,7 @@ from config import (
     client,
     db,
     users_collection,
+    admin_collection,
     reports_collection,
     departments_collection,
     test_database_connection,
@@ -86,17 +87,6 @@ def valid_email(email):
     )
 
 
-def normalize_role(role):
-    role = str(role or "").strip().lower()
-
-    if role in ("user", "citizen"):
-        return "user"
-    if role in ("admin", "administrator"):
-        return "admin"
-    if role == "department":
-        return "department"
-
-    return role
 
 
 def current_account():
@@ -611,6 +601,7 @@ def register():
 
     if (
         users_collection.find_one({"email": email})
+        or admin_collection.find_one({"email": email})
         or departments_collection.find_one({"email": email})
     ):
         return jsonify({
@@ -622,7 +613,6 @@ def register():
             "name": name,
             "email": email,
             "password_hash": generate_password_hash(password),
-            "role": "user",
             "created_at": utc_now(),
         })
     except DuplicateKeyError:
@@ -654,21 +644,17 @@ def login():
             "error": "Email and password are required."
         }), 400
 
-    user = users_collection.find_one({"email": email})
+    # 1. Check admin collection
+    admin = admin_collection.find_one({"email": email})
 
-    if user and check_password_hash(
-        user.get("password_hash", ""),
+    if admin and check_password_hash(
+        admin.get("password_hash", ""),
         password,
     ):
-        role = normalize_role(user.get("role"))
-
-        if role not in ("user", "admin"):
-            return jsonify({"error": "Invalid account role."}), 403
-
         account = {
-            "name": user.get("name", ""),
-            "email": user.get("email", email),
-            "role": role,
+            "name": admin.get("name", ""),
+            "email": admin.get("email", email),
+            "role": "admin",
         }
 
         session.clear()
@@ -680,6 +666,29 @@ def login():
             "user": account,
         }), 200
 
+    # 2. Check citizen collection
+    user = users_collection.find_one({"email": email})
+
+    if user and check_password_hash(
+        user.get("password_hash", ""),
+        password,
+    ):
+        account = {
+            "name": user.get("name", ""),
+            "email": user.get("email", email),
+            "role": "user",
+        }
+
+        session.clear()
+        session["account"] = account
+        session.permanent = True
+
+        return jsonify({
+            "message": "Login successful.",
+            "user": account,
+        }), 200
+
+    # 3. Check department collection
     department = departments_collection.find_one({"email": email})
 
     if department and check_password_hash(
@@ -708,8 +717,9 @@ def login():
             "user": account,
         }), 200
 
-    return jsonify({"error": "Invalid email or password."}), 401
-
+    return jsonify({
+        "error": "Invalid email or password."
+    }), 401
 
 @app.route("/api/me", methods=["GET"])
 @login_required
@@ -1313,8 +1323,9 @@ def admin_create_department():
             "error": "Status must be active or inactive."
         }), 400
 
-    if (
+   if (
         users_collection.find_one({"email": email})
+        or admin_collection.find_one({"email": email})
         or departments_collection.find_one({"email": email})
     ):
         return jsonify({
